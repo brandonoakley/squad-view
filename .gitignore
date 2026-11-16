@@ -1,0 +1,14 @@
+# Secrets and credentials: never commit these
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+*token*.json
+
+# Local clutter
+.DS_Store
+node_modules/
