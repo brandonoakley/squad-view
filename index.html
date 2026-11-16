@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>Squad View</title>
+<style>
+/* Layout idea: slim control bar on top, the rest of the screen is the stage.
+   One stream fills the stage, the others float as small windows along its right edge. */
+:root{
+  color-scheme:dark;
+  --bg:#11131a;
+  --surface:#1b1f2b;
+  --line:#2c3243;
+  --text:#ebe8e1;
+  --muted:#9297a8;
+  --accent:#ff7d5c;
+  --font:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font:15px/1.4 var(--font);display:flex;flex-direction:column;overflow:hidden}
+button,input{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+#bar{display:flex;flex-wrap:wrap;gap:8px;padding:8px 12px;background:var(--surface);border-bottom:1px solid var(--line);align-items:center}
+#addForm{display:flex;gap:8px;flex:1 1 260px;min-width:0}
+#url{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+#url::placeholder{color:var(--muted)}
+.btn{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 12px;cursor:pointer;white-space:nowrap}
+.btn:hover{border-color:var(--muted)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#1a0e0a;font-weight:600}
+.btn[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}
+#tools{display:flex;flex-wrap:wrap;gap:8px}
+#note{margin:0;padding:8px 12px;background:#3a2a17;color:#ffd9a8;font-size:14px}
+#note[hidden]{display:none}
+
+#stage{position:relative;flex:1;min-height:0}
+.tile{position:absolute;background:#000;border-radius:10px;overflow:hidden;transition:left .2s,top .2s,width .2s,height .2s}
+.tile.main{border-radius:0;z-index:1}
+.tile:not(.main){z-index:2;box-shadow:0 4px 18px rgba(0,0,0,.55);border:1px solid var(--line)}
+.frame,.frame iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
+.cover{position:absolute;inset:0;background:transparent;border:0;cursor:pointer;padding:0}
+.tile.main .cover,.tile.main .x{display:none}
+.name{position:absolute;left:6px;bottom:6px;max-width:calc(100% - 12px);padding:2px 7px;border-radius:6px;background:rgba(0,0,0,.7);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
+.name:empty,.tile.main .name{display:none}
+.x{position:absolute;top:4px;right:4px;width:28px;height:28px;border-radius:50%;border:0;background:rgba(0,0,0,.7);cursor:pointer;font-size:16px;line-height:1}
+.msg{position:absolute;inset:0;display:flex;flex-direction:column;gap:6px;align-items:center;justify-content:center;padding:12px;text-align:center;background:var(--surface);font-size:13px}
+.msg[hidden]{display:none}
+.msg a{color:var(--accent)}
+
+#empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:24px}
+#empty[hidden]{display:none}
+#empty div{max-width:420px}
+#empty h1{font-size:22px;margin:0 0 8px;text-wrap:balance}
+#empty p{margin:0 0 8px;color:var(--muted)}
+@media (prefers-reduced-motion:reduce){.tile{transition:none}}
+</style>
+</head>
+<body>
+<div id="bar">
+  <form id="addForm">
+    <input id="url" type="text" inputmode="url" autocomplete="off" placeholder="Paste YouTube stream links" aria-label="YouTube stream links">
+    <button class="btn primary" id="addBtn" type="submit">Add</button>
+  </form>
+  <div id="tools">
+    <button class="btn" id="soundBtn" type="button">Sound on</button>
+    <button class="btn" id="backBtn" type="button" title="Move the main stream back 5 seconds">−5s</button>
+    <button class="btn" id="fwdBtn" type="button" title="Move the main stream forward 5 seconds">+5s</button>
+    <button class="btn" id="modeBtn" type="button" aria-pressed="false">Grid</button>
+    <button class="btn" id="sizeBtn" type="button" title="Size of the small windows">Size M</button>
+    <button class="btn" id="removeBtn" type="button">Remove main</button>
+    <button class="btn" id="linkBtn" type="button">Copy link</button>
+    <button class="btn" id="fullBtn" type="button">Full screen</button>
+  </div>
+</div>
+<p id="note" hidden></p>
+<div id="stage">
+  <div id="empty"><div>
+    <h1>Watch the whole squad at once</h1>
+    <p>Open each streamer's live stream on YouTube, tap Share, copy the link, and paste it above. You can paste several links at once.</p>
+    <p>Tap a small window to make it the main one. Sound follows the main stream.</p>
+  </div></div>
+</div>
+
+<script>
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+  var stage = $('stage'), note = $('note');
+  var streams = [];            // {id, el, player, ready}
+  var mainId = null, mode = 'pip', sizeIdx = 1, sound = false, apiReady = false;
+  var SIZES = [['S',0.19],['M',0.26],['L',0.34]];
+  var GAP = 8;
+
+  function say(text){ note.textContent = text; note.hidden = !text; }
+  function get(id){ for (var i=0;i<streams.length;i++) if (streams[i].id===id) return streams[i]; return null; }
+
+  function parseId(s){
+    s = s.trim();
+    if (/^[\w-]{11}$/.test(s)) return s;
+    var m = s.match(/(?:[?&]v=|youtu\.be\/|\/live\/|\/embed\/|\/shorts\/)([\w-]{11})/);
+    return m ? m[1] : null;
+  }
+
+  function addStream(id){
+    if (get(id)) return;
+    var el = document.createElement('div');
+    el.className = 'tile';
+    el.innerHTML = '<div class="frame"><div id="p-'+id+'"></div></div>' +
+      '<div class="msg" hidden></div>' +
+      '<button class="cover" type="button" aria-label="Make this the main stream"></button>' +
+      '<span class="name"></span>' +
+      '<button class="x" type="button" aria-label="Remove this stream">×</button>';
+    stage.appendChild(el);
+    var s = {id:id, el:el, player:null, ready:false};
+    el.querySelector('.cover').addEventListener('click', function(){ setMain(id); });
+    el.querySelector('.x').addEventListener('click', function(){ removeStream(id); });
+    streams.push(s);
+    if (!mainId) mainId = id;
+    if (apiReady) makePlayer(s);
+  }
+
+  function makePlayer(s){
+    s.player = new YT.Player('p-'+s.id, {
+      width:'100%', height:'100%', videoId:s.id,
+      playerVars:{autoplay:1, mute:1, playsinline:1, rel:0},
+      events:{
+        onReady:function(){ s.ready = true; label(s); applySound(); },
+        onStateChange:function(){ label(s); },
+        onError:function(e){ showError(s, e.data); }
+      }
+    });
+  }
+
+  function label(s){
+    try{
+      var d = s.player.getVideoData();
+      if (d && (d.author || d.title)) s.el.querySelector('.name').textContent = d.author || d.title;
+    }catch(e){}
+  }
+
+  function showError(s, code){
+    var msg = s.el.querySelector('.msg'), why;
+    if (code===101 || code===150) why = 'This streamer has turned off playing on other sites.';
+    else if (code===153) why = 'YouTube blocked this page. Open it from a web address, not a saved file.';
+    else if (code===100) why = 'This stream was not found or is private.';
+    else why = 'This stream could not be played (error '+code+').';
+    msg.innerHTML = '';
+    var p = document.createElement('span'); p.textContent = why;
+    var a = document.createElement('a'); a.href = 'https://www.youtube.com/watch?v='+s.id; a.target = '_blank'; a.rel = 'noopener'; a.textContent = 'Open on YouTube';
+    msg.appendChild(p); msg.appendChild(a);
+    msg.hidden = false;
+  }
+
+  function applySound(){
+    streams.forEach(function(s){
+      if (!s.ready) return;
+      try{
+        if (s.id===mainId && sound){ s.player.unMute(); s.player.setVolume(100); }
+        else s.player.mute();
+      }catch(e){}
+    });
+    $('soundBtn').textContent = sound ? 'Sound off' : 'Sound on';
+  }
+
+  function setMain(id){
+    var old = get(mainId);
+    if (old && old.ready){ try{ sound = !old.player.isMuted(); }catch(e){} }
+    mainId = id;
+    applySound(); layout(); save();
+  }
+
+  function removeStream(id){
+    var s = get(id); if (!s) return;
+    try{ if (s.player && s.player.destroy) s.player.destroy(); }catch(e){}
+    s.el.remove();
+    streams = streams.filter(function(x){ return x!==s; });
+    if (mainId===id) mainId = streams.length ? streams[0].id : null;
+    applySound(); layout(); save();
+  }
+
+  // Best equal-size 16:9 grid for n tiles in a W x H box.
+  function fitGrid(n, W, H){
+    var best = {cols:1, w:0, h:0};
+    for (var c=1;c<=n;c++){
+      var r = Math.ceil(n/c);
+      var w = (W - GAP*(c+1))/c, h = w*9/16;
+      if (r*h + GAP*(r+1) > H){ h = (H - GAP*(r+1))/r; w = h*16/9; }
+      if (w > best.w) best = {cols:c, w:w, h:h};
+    }
+    return best;
+  }
+  function place(s, x, y, w, h, isMain){
+    s.el.classList.toggle('main', isMain);
+    s.el.style.left = x+'px'; s.el.style.top = y+'px';
+    s.el.style.width = w+'px'; s.el.style.height = h+'px';
+  }
+  function gridInto(list, x0, y0, W, H){
+    if (!list.length) return;
+    var g = fitGrid(list.length, W, H);
+    var rows = Math.ceil(list.length/g.cols);
+    var offX = x0 + (W - (g.cols*g.w + (g.cols-1)*GAP))/2;
+    var offY = y0 + Math.max(GAP, (H - (rows*g.h + (rows-1)*GAP))/2);
+    list.forEach(function(s,i){
+      place(s, offX + (i%g.cols)*(g.w+GAP), offY + Math.floor(i/g.cols)*(g.h+GAP), g.w, g.h, false);
+    });
+  }
+
+  function layout(){
+    $('empty').hidden = streams.length > 0;
+    var W = stage.clientWidth, H = stage.clientHeight;
+    if (!streams.length || !W || !H) return;
+    var main = get(mainId), rest = streams.filter(function(s){ return s.id!==mainId; });
+
+    if (mode==='grid'){
+      gridInto(streams, 0, 0, W, H);
+      streams.forEach(function(s){ s.el.classList.remove('main'); });
+      return;
+    }
+    if (H > W*1.05){
+      // Tall screen (phone held upright): main on top, the rest in a grid below.
+      var mh = Math.min(W*9/16, H*0.6);
+      place(main, (W - mh*16/9)/2, 0, mh*16/9, mh, true);
+      gridInto(rest, 0, mh, W, H - mh);
+      return;
+    }
+    // Wide screen: main fills the stage, the rest float down the right edge.
+    var mw = Math.min(W, H*16/9), mh2 = mw*9/16;
+    place(main, (W-mw)/2, (H-mh2)/2, mw, mh2, true);
+    var pw = Math.max(110, W*SIZES[sizeIdx][1]), ph = pw*9/16;
+    var perCol = Math.max(1, Math.floor((H - 56 - GAP)/(ph+GAP)));   // keep the player's control bar clear
+    rest.forEach(function(s,i){
+      var col = Math.floor(i/perCol), row = i%perCol;
+      place(s, W - (col+1)*(pw+GAP), GAP + row*(ph+GAP), pw, ph, false);
+    });
+  }
+
+  function orderedIds(){
+    var ids = streams.map(function(s){ return s.id; }).filter(function(id){ return id!==mainId; });
+    if (mainId) ids.unshift(mainId);
+    return ids;
+  }
+  function save(){
+    var ids = orderedIds();
+    try{ localStorage.setItem('squad-view', ids.join(',')); }catch(e){}
+    try{ history.replaceState(null, '', ids.length ? '?v='+ids.join(',') : location.pathname); }catch(e){}
+  }
+  function load(){
+    var q = new URLSearchParams(location.search).get('v'), saved = '';
+    try{ saved = localStorage.getItem('squad-view') || ''; }catch(e){}
+    (q || saved).split(',').forEach(function(x){ var id = parseId(x); if (id) addStream(id); });
+  }
+
+  $('addForm').addEventListener('submit', function(e){
+    e.preventDefault();
+    var parts = $('url').value.split(/[\s,]+/).filter(Boolean), bad = 0;
+    parts.forEach(function(p){ var id = parseId(p); if (id) addStream(id); else bad++; });
+    $('url').value = '';
+    say(bad ? 'Could not read '+bad+' link'+(bad>1?'s':'')+'. Use the link of the live stream itself (Share, then Copy link), not the channel page.' : '');
+    layout(); save();
+  });
+  $('soundBtn').addEventListener('click', function(){
+    var m = get(mainId);
+    if (m && m.ready){ try{ sound = m.player.isMuted(); }catch(e){ sound = !sound; } } else sound = !sound;
+    applySound();
+  });
+  function nudge(sec){
+    var m = get(mainId); if (!m || !m.ready) return;
+    try{ m.player.seekTo(Math.max(0, m.player.getCurrentTime()+sec), true); }catch(e){}
+  }
+  $('backBtn').addEventListener('click', function(){ nudge(-5); });
+  $('fwdBtn').addEventListener('click', function(){ nudge(5); });
+  $('modeBtn').addEventListener('click', function(){
+    mode = mode==='pip' ? 'grid' : 'pip';
+    this.setAttribute('aria-pressed', mode==='grid');
+    layout();
+  });
+  $('sizeBtn').addEventListener('click', function(){
+    sizeIdx = (sizeIdx+1) % SIZES.length;
+    this.textContent = 'Size '+SIZES[sizeIdx][0];
+    layout();
+  });
+  $('removeBtn').addEventListener('click', function(){ if (mainId) removeStream(mainId); });
+  $('linkBtn').addEventListener('click', function(){
+    var btn = this, href = location.href;
+    function fallback(){ $('url').value = href; $('url').select(); say('Copy the link from the box above.'); }
+    if (navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(href).then(function(){
+        btn.textContent = 'Copied'; setTimeout(function(){ btn.textContent = 'Copy link'; }, 1500);
+      }, fallback);
+    } else fallback();
+  });
+  $('fullBtn').addEventListener('click', function(){
+    var d = document, el = d.documentElement;
+    try{
+      if (d.fullscreenElement) d.exitFullscreen();
+      else if (el.requestFullscreen) el.requestFullscreen().catch(function(){});
+    }catch(e){}
+  });
+
+  if (window.ResizeObserver) new ResizeObserver(layout).observe(stage);
+  window.addEventListener('resize', layout);
+
+  window.onYouTubeIframeAPIReady = function(){
+    apiReady = true;
+    streams.forEach(function(s){ if (!s.player) makePlayer(s); });
+  };
+
+  if (location.protocol === 'file:') say('YouTube will not play from a file opened directly. Open this page from a web address instead.');
+  load(); layout();
+
+  var tag = document.createElement('script');
+  tag.src = 'https://www.youtube.com/iframe_api';
+  tag.onerror = function(){ say('Could not reach YouTube. Check your connection or ad blocker and reload.'); };
+  document.head.appendChild(tag);
+})();
+</script>
+</body>
+</html>
